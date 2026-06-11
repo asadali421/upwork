@@ -251,7 +251,7 @@ def job_passes_filter(job: dict, cfg: dict) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM layer — supports free Gemini tier OR Claude API
+# LLM layer — supports Groq (free), Gemini (free tier), or Claude (paid)
 # ---------------------------------------------------------------------------
 
 PROPOSAL_SYSTEM = """You write short, high-converting Upwork proposals.
@@ -279,11 +279,13 @@ def _post_with_retry(url: str, *, headers: dict | None = None,
         if r.status_code in (429, 500, 502, 503) and attempt < max_retries:
             retry_after = r.headers.get("Retry-After")
             wait = float(retry_after) if (retry_after and retry_after.isdigit()) else delay
-            log.warning("LLM %s — backing off %.0fs (attempt %d/%d)",
-                        r.status_code, wait, attempt, max_retries)
+            log.warning("LLM %s — backing off %.0fs (attempt %d/%d): %s",
+                        r.status_code, wait, attempt, max_retries, r.text[:300])
             time.sleep(wait)
             delay = min(delay * 2, 60)
             continue
+        if not r.ok:
+            log.error("LLM %s response: %s", r.status_code, r.text[:500])
         r.raise_for_status()
         return r
     r.raise_for_status()  # exhausted retries on a retryable status
@@ -327,6 +329,25 @@ def call_llm(cfg: dict, system: str, prompt: str, max_tokens: int = 600) -> str:
             },
         )
         return r.json()["content"][0]["text"].strip()
+
+    elif provider == "groq":
+        # Groq — FREE tier, fast, no billing/region lock. OpenAI-compatible API.
+        r = _post_with_retry(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {cfg['llm']['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json_body={
+                "model": cfg["llm"].get("model", "llama-3.3-70b-versatile"),
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+        )
+        return r.json()["choices"][0]["message"]["content"].strip()
 
     else:
         raise ValueError(f"Unknown llm provider: {provider}")
