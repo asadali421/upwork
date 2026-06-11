@@ -269,6 +269,27 @@ Rules:
 """
 
 
+def _post_with_retry(url: str, *, headers: dict | None = None,
+                     json_body: dict, max_retries: int = 4) -> requests.Response:
+    """POST with exponential backoff on rate-limit / transient errors
+    (429, 500, 502, 503). Honors a Retry-After header when present."""
+    delay = 2.0
+    for attempt in range(1, max_retries + 1):
+        r = requests.post(url, headers=headers, json=json_body, timeout=60)
+        if r.status_code in (429, 500, 502, 503) and attempt < max_retries:
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if (retry_after and retry_after.isdigit()) else delay
+            log.warning("LLM %s — backing off %.0fs (attempt %d/%d)",
+                        r.status_code, wait, attempt, max_retries)
+            time.sleep(wait)
+            delay = min(delay * 2, 60)
+            continue
+        r.raise_for_status()
+        return r
+    r.raise_for_status()  # exhausted retries on a retryable status
+    return r
+
+
 def call_llm(cfg: dict, system: str, prompt: str, max_tokens: int = 600) -> str:
     provider = cfg["llm"]["provider"]
 
@@ -279,36 +300,32 @@ def call_llm(cfg: dict, system: str, prompt: str, max_tokens: int = 600) -> str:
             f"{cfg['llm'].get('model', 'gemini-2.0-flash')}:generateContent"
             f"?key={cfg['llm']['api_key']}"
         )
-        r = requests.post(
+        r = _post_with_retry(
             url,
-            json={
+            json_body={
                 "system_instruction": {"parts": [{"text": system}]},
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": max_tokens},
             },
-            timeout=60,
         )
-        r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     elif provider == "claude":
         # Anthropic Claude — paid, ~$0.01-0.03 per job, best proposal quality
-        r = requests.post(
+        r = _post_with_retry(
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": cfg["llm"]["api_key"],
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
+            json_body={
                 "model": cfg["llm"].get("model", "claude-sonnet-4-20250514"),
                 "max_tokens": max_tokens,
                 "system": system,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=60,
         )
-        r.raise_for_status()
         return r.json()["content"][0]["text"].strip()
 
     else:
@@ -412,25 +429,32 @@ def run_once(cfg: dict, seen: set, min_score: int) -> None:
     if new_jobs:
         log.info("%d new job(s) from email alerts.", len(new_jobs))
 
-    for job in new_jobs:
-        seen.add(job["id"])
-        passes, reason = job_passes_filter(job, cfg)
-        if not passes:
-            log.info("Skipped '%s' (%s)", job["title"][:50], reason)
-            continue
+    try:
+        for job in new_jobs:
+            seen.add(job["id"])
+            passes, reason = job_passes_filter(job, cfg)
+            if not passes:
+                log.info("Skipped '%s' (%s)", job["title"][:50], reason)
+                continue
 
-        score = score_job(cfg, job)
-        if score["score"] < min_score:
-            log.info("Low fit %s/10 — skipping '%s'",
-                     score["score"], job["title"][:50])
-            continue
+            try:
+                score = score_job(cfg, job)
+                if score["score"] < min_score:
+                    log.info("Low fit %s/10 — skipping '%s'",
+                             score["score"], job["title"][:50])
+                    continue
 
-        proposal = generate_proposal(cfg, job)
-        notify(cfg, format_alert(job, score, proposal))
-        log.info("Alert sent: '%s' (fit %s/10)",
-                 job["title"][:50], score["score"])
-
-    save_seen(seen)
+                proposal = generate_proposal(cfg, job)
+                notify(cfg, format_alert(job, score, proposal))
+                log.info("Alert sent: '%s' (fit %s/10)",
+                         job["title"][:50], score["score"])
+            except Exception:
+                # One job failing (e.g. LLM error) shouldn't abort the pass.
+                log.exception("Failed to process '%s' — continuing",
+                              job["title"][:50])
+    finally:
+        # Persist progress even if something blows up mid-pass.
+        save_seen(seen)
 
 
 def config_from_env() -> dict | None:
