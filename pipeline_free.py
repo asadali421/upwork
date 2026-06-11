@@ -193,7 +193,11 @@ def fetch_new_alert_emails(cfg: dict) -> list[dict]:
         status, data = mail.search(None, '(UNSEEN FROM "upwork.com")')
         if status != "OK":
             return jobs
-        for num in data[0].split():
+        # IMAP returns oldest-first; keep only the most recent N so a backlog
+        # doesn't trigger a flood of LLM calls and alerts in one pass.
+        max_emails = cfg.get("max_emails", 10)
+        nums = data[0].split()[-max_emails:]
+        for num in nums:
             status, msg_data = mail.fetch(num, "(RFC822)")
             if status != "OK":
                 continue
@@ -437,6 +441,7 @@ def config_from_env() -> dict | None:
         return None
     return {
         "poll_seconds": 60,
+        "max_emails": int(os.environ.get("MAX_EMAILS", "10")),
         "email": {
             "address": os.environ["EMAIL_ADDRESS"],
             "app_password": os.environ["EMAIL_APP_PASSWORD"],
