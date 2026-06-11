@@ -1,0 +1,18 @@
+# Secrets / config (contains app password, API keys, webhook URLs)
+config_free*.json
+config.json
+
+# Runtime state
+seen_jobs.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
